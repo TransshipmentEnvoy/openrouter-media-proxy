@@ -5,6 +5,8 @@ services:
     image: python:3.14-slim
     restart: unless-stopped
     working_dir: /app
+    ports:
+      - "${PROXY_PORT:-8080}:8080"
     environment:
       - OPENROUTER_URL=https://openrouter.ai/api/v1
       # You can use "image,text" for Gemini-style models; default works for all image models.
