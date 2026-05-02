@@ -267,7 +267,11 @@ class ProxyImageTests(unittest.TestCase):
             self.assertEqual(call["body"]["modalities"], openrouter_media_proxy._image_modalities())
             self.assertEqual(
                 call["body"]["image_config"],
-                {"aspect_ratio": "16:9", "image_size": "4K"},
+                {
+                    "aspect_ratio": "16:9",
+                    "background": "transparent",
+                    "image_size": "4K",
+                },
             )
             self.assertIn("A mountain cabin at sunset", call["body"]["messages"][0]["content"])
             self.assertIn("vivid, dramatic style", call["body"]["messages"][0]["content"])
@@ -277,7 +281,197 @@ class ProxyImageTests(unittest.TestCase):
             )
         self.assertEqual(sorted(call["idx"] for call in calls), [0, 1])
 
-    def test_edits_json_translates_images_and_mask(self) -> None:
+    def test_generations_support_response_format_url_and_usage(self) -> None:
+        calls: list[dict] = []
+
+        async def fake_call_upstream(client, body, headers, rid, idx):
+            calls.append(
+                {
+                    "body": body,
+                    "headers": headers,
+                    "idx": idx,
+                }
+            )
+            return (
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "Refined prompt",
+                                "images": [
+                                    {
+                                        "image_url": {
+                                            "url": "data:image/webp;base64,V0VCUA=="
+                                        }
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 15,
+                        "total_tokens": 25,
+                        "prompt_tokens_details": {
+                            "image_tokens": 4,
+                            "text_tokens": 6,
+                        },
+                        "completion_tokens_details": {
+                            "image_tokens": 12,
+                            "text_tokens": 3,
+                        },
+                    },
+                },
+                None,
+            )
+
+        with patch.object(openrouter_media_proxy, "_call_upstream", new=fake_call_upstream):
+            response = self.client.post(
+                "/v1/images/generations",
+                headers={"Authorization": "Bearer test-key"},
+                json={
+                    "background": "transparent",
+                    "model": "google/gemini-2.5-flash-image-preview",
+                    "moderation": "low",
+                    "n": 2,
+                    "output_compression": 70,
+                    "output_format": "webp",
+                    "prompt": "A lantern floating over a lake",
+                    "quality": "medium",
+                    "response_format": "url",
+                    "seed": 123,
+                    "size": "1024x1536",
+                    "user": "user_123",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "created": response.json()["created"],
+                "data": [
+                    {
+                        "revised_prompt": "Refined prompt",
+                        "url": "data:image/webp;base64,V0VCUA==",
+                    },
+                    {
+                        "revised_prompt": "Refined prompt",
+                        "url": "data:image/webp;base64,V0VCUA==",
+                    },
+                ],
+                "usage": {
+                    "input_tokens": 20,
+                    "input_tokens_details": {
+                        "image_tokens": 8,
+                        "text_tokens": 12,
+                    },
+                    "output_tokens": 30,
+                    "output_tokens_details": {
+                        "image_tokens": 24,
+                        "text_tokens": 6,
+                    },
+                    "total_tokens": 50,
+                },
+            },
+        )
+
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertEqual(call["body"]["seed"], 123)
+            self.assertEqual(call["body"]["user"], "user_123")
+            self.assertEqual(
+                call["body"]["image_config"],
+                {
+                    "aspect_ratio": "2:3",
+                    "background": "transparent",
+                    "image_size": "2K",
+                    "moderation": "low",
+                    "output_compression": 70,
+                    "output_format": "webp",
+                },
+            )
+
+    def test_edits_extract_images_from_content_parts(self) -> None:
+        async def fake_call_upstream(client, body, headers, rid, idx):
+            return (
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [
+                                    {"type": "text", "text": "Edited image"},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": "data:image/png;base64,RURJVA=="
+                                        },
+                                    },
+                                ],
+                            }
+                        }
+                    ]
+                },
+                None,
+            )
+
+        with patch.object(openrouter_media_proxy, "_call_upstream", new=fake_call_upstream):
+            response = self.client.post(
+                "/v1/images/edits",
+                data={
+                    "model": "google/gemini-2.5-flash-image-preview",
+                    "prompt": "Replace the sky with stars",
+                },
+                files=[("image", ("source.png", b"\x89PNG", "image/png"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["data"],
+            [{"b64_json": "RURJVA==", "revised_prompt": "Edited image"}],
+        )
+
+    def test_edits_json_rejects_mask_by_default(self) -> None:
+        async def unexpected_call_upstream(client, body, headers, rid, idx):
+            raise AssertionError("_call_upstream should not be called when mask handling is rejected")
+
+        with patch.object(
+            openrouter_media_proxy,
+            "_call_upstream",
+            new=unexpected_call_upstream,
+        ):
+            response = self.client.post(
+                "/v1/images/edits",
+                headers={"Authorization": "Bearer test-key"},
+                json={
+                    "background": "transparent",
+                    "images": [
+                        {"image_url": "data:image/png;base64,SU1BR0Ux"},
+                    ],
+                    "mask": {"image_url": "data:image/png;base64,TUFTSw=="},
+                    "model": "google/gemini-2.5-flash-image-preview",
+                    "prompt": "Add a rainbow",
+                    "quality": "hd",
+                    "size": "1024x1024",
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {
+                "error": {
+                    "message": (
+                        "Mask-based image edits are not supported by this proxy. "
+                        "OpenRouter chat/completions does not expose a native mask primitive, "
+                        "so true OpenAI-style inpainting semantics cannot be translated."
+                    ),
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    def test_edits_json_can_passthrough_mask_when_enabled(self) -> None:
         captured: dict = {}
 
         async def fake_call_upstream(client, body, headers, rid, idx):
@@ -303,22 +497,23 @@ class ProxyImageTests(unittest.TestCase):
                 None,
             )
 
-        with patch.object(openrouter_media_proxy, "_call_upstream", new=fake_call_upstream):
-            response = self.client.post(
-                "/v1/images/edits",
-                headers={"Authorization": "Bearer test-key"},
-                json={
-                    "background": "transparent",
-                    "images": [
-                        {"image_url": "data:image/png;base64,SU1BR0Ux"},
-                    ],
-                    "mask": {"image_url": "data:image/png;base64,TUFTSw=="},
-                    "model": "google/gemini-2.5-flash-image-preview",
-                    "prompt": "Add a rainbow",
-                    "quality": "hd",
-                    "size": "1024x1024",
-                },
-            )
+        with patch.object(openrouter_media_proxy, "IMAGE_EDIT_MASK_MODE", "passthrough"):
+            with patch.object(openrouter_media_proxy, "_call_upstream", new=fake_call_upstream):
+                response = self.client.post(
+                    "/v1/images/edits",
+                    headers={"Authorization": "Bearer test-key"},
+                    json={
+                        "background": "transparent",
+                        "images": [
+                            {"image_url": "data:image/png;base64,SU1BR0Ux"},
+                        ],
+                        "mask": {"image_url": "data:image/png;base64,TUFTSw=="},
+                        "model": "google/gemini-2.5-flash-image-preview",
+                        "prompt": "Add a rainbow",
+                        "quality": "hd",
+                        "size": "1024x1024",
+                    },
+                )
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -331,7 +526,11 @@ class ProxyImageTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["Authorization"], "Bearer test-key")
         self.assertEqual(
             captured["body"]["image_config"],
-            {"aspect_ratio": "1:1", "image_size": "2K"},
+            {
+                "aspect_ratio": "1:1",
+                "background": "transparent",
+                "image_size": "2K",
+            },
         )
         content_parts = captured["body"]["messages"][0]["content"]
         self.assertEqual(content_parts[0]["type"], "text")
@@ -376,10 +575,7 @@ class ProxyImageTests(unittest.TestCase):
                     "model": "google/gemini-2.5-flash-image-preview",
                     "prompt": "Replace the sky with stars",
                 },
-                files=[
-                    ("image", ("source.png", b"\x89PNG", "image/png")),
-                    ("mask", ("mask.png", b"MASK", "image/png")),
-                ],
+                files=[("image", ("source.png", b"\x89PNG", "image/png"))],
             )
 
         self.assertEqual(response.status_code, 200)
@@ -399,13 +595,146 @@ class ProxyImageTests(unittest.TestCase):
                         "url": "data:image/png;base64,iVBORw==",
                     },
                 },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": "data:image/png;base64,TUFTSw==",
-                    },
-                },
             ],
+        )
+
+    def test_edits_multipart_rejects_mask_by_default(self) -> None:
+        async def unexpected_call_upstream(client, body, headers, rid, idx):
+            raise AssertionError("_call_upstream should not be called when mask handling is rejected")
+
+        with patch.object(
+            openrouter_media_proxy,
+            "_call_upstream",
+            new=unexpected_call_upstream,
+        ):
+            response = self.client.post(
+                "/v1/images/edits",
+                data={
+                    "model": "google/gemini-2.5-flash-image-preview",
+                    "prompt": "Replace the sky with stars",
+                },
+                files=[
+                    ("image", ("source.png", b"\x89PNG", "image/png")),
+                    ("mask", ("mask.png", b"MASK", "image/png")),
+                ],
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {
+                "error": {
+                    "message": (
+                        "Mask-based image edits are not supported by this proxy. "
+                        "OpenRouter chat/completions does not expose a native mask primitive, "
+                        "so true OpenAI-style inpainting semantics cannot be translated."
+                    ),
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    def test_edits_forward_low_risk_image_options(self) -> None:
+        captured: dict = {}
+
+        async def fake_call_upstream(client, body, headers, rid, idx):
+            captured["body"] = body
+            return (
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "images": [
+                                    {
+                                        "image_url": {
+                                            "url": "data:image/png;base64,RURJVA=="
+                                        }
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                None,
+            )
+
+        with patch.object(openrouter_media_proxy, "_call_upstream", new=fake_call_upstream):
+            response = self.client.post(
+                "/v1/images/edits",
+                data={
+                    "background": "opaque",
+                    "input_fidelity": "high",
+                    "model": "google/gemini-2.5-flash-image-preview",
+                    "moderation": "low",
+                    "output_compression": "55",
+                    "output_format": "jpeg",
+                    "prompt": "Turn this into a studio portrait",
+                    "quality": "medium",
+                    "seed": "777",
+                    "size": "1536x1024",
+                    "user": "editor-7",
+                },
+                files=[("image", ("source.png", b"\x89PNG", "image/png"))],
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"], [{"b64_json": "RURJVA=="}])
+        self.assertEqual(captured["body"]["seed"], 777)
+        self.assertEqual(captured["body"]["user"], "editor-7")
+        self.assertEqual(
+            captured["body"]["image_config"],
+            {
+                "aspect_ratio": "3:2",
+                "background": "opaque",
+                "image_size": "2K",
+                "input_fidelity": "high",
+                "moderation": "low",
+                "output_compression": 55,
+                "output_format": "jpeg",
+            },
+        )
+
+    def test_generations_invalid_size_returns_400(self) -> None:
+        response = self.client.post(
+            "/v1/images/generations",
+            json={
+                "model": "google/gemini-2.5-flash-image-preview",
+                "prompt": "A city skyline",
+                "size": "9999x9999",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {
+                "error": {
+                    "message": "Invalid size. Supported values: auto, 256x256, 512x512, 1024x1024, 1536x1024, 1024x1536, 1792x1024, 1024x1792.",
+                    "type": "invalid_request_error",
+                }
+            },
+        )
+
+    def test_edits_invalid_output_compression_returns_400(self) -> None:
+        response = self.client.post(
+            "/v1/images/edits",
+            data={
+                "model": "google/gemini-2.5-flash-image-preview",
+                "output_compression": "101",
+                "prompt": "Tight crop",
+            },
+            files=[("image", ("source.png", b"\x89PNG", "image/png"))],
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json(),
+            {
+                "error": {
+                    "message": "Invalid output_compression. Must be less than or equal to 100.",
+                    "type": "invalid_request_error",
+                }
+            },
         )
 
 
